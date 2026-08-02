@@ -482,6 +482,25 @@ class GPT(nn.Module):
 
 # -----------------------------------------------------------------------------
 
+def pick_amp_dtype(device_type):
+    """bf16 only where there is hardware for it, otherwise fp16.
+
+    Deliberately NOT torch.cuda.is_bf16_supported(): that defaults to
+    including_emulation=True, so on Turing (SM 7.5, e.g. Kaggle's T4) the
+    compute-capability test fails but it falls through to an emulation check
+    that succeeds and returns True. Turing has fp16 tensor cores and no bf16
+    ones, so taking it at its word puts every matmul on a non-tensor-core path.
+    Measured on a Kaggle T4: ~11k tok/s under emulated bf16, where the point of
+    this function was to select fp16 in exactly that case.
+
+    bf16 tensor cores start at SM 8.0 (Ampere).
+    """
+    if device_type != "cuda":
+        return torch.bfloat16
+    major, _ = torch.cuda.get_device_capability()
+    return torch.bfloat16 if major >= 8 else torch.float16
+
+
 def load_tokens(filename):
     npt = np.load(filename)
     npt = npt.astype(np.int32) # added after video
@@ -659,16 +678,13 @@ def main():
     # hardware instead of hardcoding it. fp16 has the same 10-bit mantissa as
     # bf16 but far less exponent range, so it needs loss scaling to keep small
     # gradients from flushing to zero; bf16 does not.
-    if args.dtype != "auto":
-        amp_dtype = getattr(torch, args.dtype)
-    elif device_type == "cuda":
-        amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
-    else:
-        amp_dtype = torch.bfloat16
+    amp_dtype = getattr(torch, args.dtype) if args.dtype != "auto" else pick_amp_dtype(device_type)
     use_scaler = (amp_dtype == torch.float16)
     scaler = torch.amp.GradScaler(device_type, enabled=use_scaler)
     if master_process:
-        print(f"autocast dtype: {amp_dtype} (GradScaler: {use_scaler})")
+        cap = f"SM {'.'.join(map(str, torch.cuda.get_device_capability()))}" \
+              if device_type == "cuda" else device_type
+        print(f"autocast dtype: {amp_dtype} on {cap} (GradScaler: {use_scaler})")
 
     torch.manual_seed(args.seed)
     if torch.cuda.is_available():

@@ -23,7 +23,7 @@ import argparse
 import torch
 import torch.nn as nn
 
-from train_modern_gpt import GPT, GPTConfig
+from train_modern_gpt import GPT, GPTConfig, pick_amp_dtype
 
 # -----------------------------------------------------------------------------
 
@@ -40,8 +40,9 @@ def pick_dtype(device_type, requested):
         return getattr(torch, requested)
     if device_type != "cuda":
         return torch.float32
-    # T4 (SM 7.5) has no bf16; fall back to fp16 rather than silently crawling
-    return torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+    # capability-based, see pick_amp_dtype: is_bf16_supported() reports True on
+    # Turing via emulation, which selects a path with no tensor cores at all
+    return pick_amp_dtype(device_type)
 
 
 def build_model(args, device):
