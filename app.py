@@ -75,7 +75,7 @@ section[data-testid="stSidebar"] hr { margin:14px 0; }
 </style>
 """
 
-st.set_page_config(page_title="Modern nanoGPT", layout="wide")
+st.set_page_config(page_title="CoreGPT", page_icon="⚡", layout="wide")
 st.markdown(CSS, unsafe_allow_html=True)
 
 
@@ -113,6 +113,23 @@ def untrained(pos, norm, device, weight_dtype):
             "params": sum(p.numel() for p in model.parameters()),
             "step": None, "val_loss": None, "ctx": cfg.block_size}
     return model, info
+
+
+def cpu_budget():
+    try:
+        quota, period = open("/sys/fs/cgroup/cpu.max").read().split()
+        if quota != "max":
+            return int(quota) / int(period)
+    except OSError:
+        pass
+    try:
+        quota = int(open("/sys/fs/cgroup/cpu/cpu.cfs_quota_us").read())
+        period = int(open("/sys/fs/cgroup/cpu/cpu.cfs_period_us").read())
+        if quota > 0:
+            return quota / period
+    except OSError:
+        pass
+    return float(os.cpu_count() or 1)
 
 
 def autocast(device, dtype):
@@ -220,10 +237,17 @@ else:
     WEIGHT_DTYPE, dtype = torch.bfloat16, torch.bfloat16
 USE_CACHE = True
 KV_DTYPE = dtype if device == "cuda" else WEIGHT_DTYPE
-hardware = torch.cuda.get_device_name(0) if device == "cuda" else "CPU"
+
+if device == "cuda":
+    hardware = torch.cuda.get_device_name(0)
+    BENCH_BATCH, BENCH_TOKENS = 16, 160
+else:
+    vcpu = cpu_budget()
+    hardware = f"CPU · {vcpu:g} vCPU · {torch.get_num_threads()} threads"
+    BENCH_BATCH, BENCH_TOKENS = 4, 64
 
 st.markdown(
-    f'<div class="masthead"><h1>Modern nanoGPT</h1>'
+    f'<div class="masthead"><h1>CoreGPT</h1>'
     f'<div class="hw">{html.escape(hardware)} &middot; {str(dtype).split(".")[-1]}</div></div>',
     unsafe_allow_html=True)
 
@@ -315,14 +339,25 @@ with cache_tab:
     bench_prompt = st.text_area("Prompt", BENCH_PROMPT, height=110,
                                 key="bench_prompt", label_visibility="collapsed")
     left, right, action = st.columns([2, 2, 1])
-    count = left.slider("Tokens", 32, 400, 160, 8, key="bench_tokens")
-    batch = right.select_slider("Batch", [1, 2, 4, 8, 16, 32], value=16, key="bench_batch")
+    count = left.slider("Tokens", 32, 400, BENCH_TOKENS, 8, key="bench_tokens")
+    batch = right.select_slider("Batch", [1, 2, 4, 8, 16, 32], value=BENCH_BATCH,
+                                key="bench_batch")
     action.markdown("<div style='height:26px'></div>", unsafe_allow_html=True)
     start_bench = action.button("Run", type="primary", width="stretch")
-    st.markdown('<div class="note">The same decode run twice inside one model. Below '
-                'batch 8 the cache is usually slower, because a single-token step is '
-                'bound by kernel launches rather than arithmetic.</div>',
-                unsafe_allow_html=True)
+
+    prompt_len = len(enc.encode(bench_prompt)) if bench_prompt.strip() else 1
+    work = batch * count * (prompt_len + count / 2) * len(loaded)
+    st.markdown(
+        f'<div class="note">The same decode run twice inside one model. The uncached '
+        f'half re-forwards the whole prefix every step, so at batch {batch} and {count} '
+        f'tokens it moves <b>{work/1e6:.2f}M token-positions</b> across {len(loaded)} '
+        f'model(s) — the cached half moves {batch*count*len(loaded)/1e6:.3f}M. That gap '
+        f'is the measurement, and on CPU it is also the wait.</div>',
+        unsafe_allow_html=True)
+    if device != "cuda" and work > 60_000:
+        st.markdown('<div class="note">⚠ This will take a while on CPU. Drop the batch '
+                    'or token count for a quicker result — the trend holds at any '
+                    'size.</div>', unsafe_allow_html=True)
 
     if start_bench:
         ids = enc.encode(bench_prompt) if bench_prompt.strip() else [enc.eot_token]

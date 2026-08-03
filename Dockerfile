@@ -16,7 +16,10 @@ RUN python -c "import tiktoken; tiktoken.get_encoding('gpt2').encode('warm')"
 COPY train_modern_gpt.py app.py ./
 COPY models/ ./models/
 
-# One vCPU: more threads than cores costs more in contention than it gains.
+# Must match the container's vCPU allocation. torch reads the host core count, not
+# the cgroup limit, so leaving this unset over-subscribes and loses to contention.
+# Override without rebuilding:
+#   az containerapp update -n <app> -g <rg> --set-env-vars OMP_NUM_THREADS=4
 ENV OMP_NUM_THREADS=1 \
     STREAMLIT_SERVER_HEADLESS=true \
     STREAMLIT_BROWSER_GATHER_USAGE_STATS=false
