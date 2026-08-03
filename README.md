@@ -41,29 +41,40 @@ all three; only `--pos` and `--norm` differ. Trained on a Kaggle T4.
 | + RoPE   | rope     | LayerNorm | 29,964,288 | **3.9251** | **50.66** | **−0.1238** |      40,425 |
 | modern   | rope     | RMSNorm   | 29,959,296 |     3.9277 |     50.79 |     −0.1212 |      45,259 |
 
-### KV cache, by batch size
+### KV cache
 
-Modern model, 200 generated tokens, RTX 3050:
+Measured with `lm_head` projecting **only the last position on both paths** — see finding 5.
+A naive uncached baseline that projects the whole prefix every step makes the cache look
+2-5x better than it is, because most of that gap is a wasted matmul rather than the cache.
 
-| Batch |     cache off | cache on |   Speedup |
-| ----: | ------------: | -------: | --------: |
-|     1 | 11.87 ms/step |    12.01 |     0.99x |
-|     4 |         13.40 |    15.95 | **0.84x** |
-|     8 |         41.46 |    16.58 |     2.50x |
-|    16 |         80.23 |    15.58 | **5.15x** |
+GPU (RTX 3050), modern model, 160 new tokens:
 
-### KV cache, by context length
+| Batch | cache off | cache on | Speedup |
+| ----: | --------: | -------: | ------: |
+|     1 | 16.48 ms/step | 13.92 |   1.18x |
+|     4 |         12.85 | 14.68 |   0.88x |
+|     8 |         12.39 | 13.65 |   0.91x |
+|    16 |         13.12 | 13.12 |   1.00x |
+|    32 |         20.43 | 18.87 |   1.08x |
 
-Batch 8, bf16, RTX 3050:
+CPU (2 threads, bf16), batch 1:
 
-| Prompt | Gen | Cache | Tok/s | ms/token | Peak VRAM (MB) | Cache (MB) |   Speedup |
-| -----: | --: | :---: | ----: | -------: | -------------: | ---------: | --------: |
-|     64 | 128 |  no   | 529.9 |    15.10 |          355.1 |          – |     1.00x |
-|     64 | 128 |  yes  | 815.8 |     9.81 |          262.1 |       14.2 |     1.54x |
-|    128 | 256 |  no   | 278.8 |    28.69 |          516.6 |          – |     1.00x |
-|    128 | 256 |  yes  | 775.1 |    10.32 |          328.7 |       28.3 |     2.78x |
-|    256 | 256 |  no   | 266.8 |    29.98 |          622.5 |          – |     1.00x |
-|    256 | 256 |  yes  | 756.2 |    10.58 |          447.1 |       37.7 | **2.83x** |
+| Prompt | Gen | cache off | cache on |    Speedup |
+| -----: | --: | --------: | -------: | ---------: |
+|     20 |  60 |  6.5 tok/s |     71.1 |  **11.0x** |
+|     73 | 120 |       2.6 |     62.5 |  **24.3x** |
+|    190 | 120 |       1.4 |     52.2 |  **38.5x** |
+
+GPU, batch 8, by context length:
+
+| Prompt | Gen | Cache | Tok/s | ms/token | Peak VRAM (MB) | Cache (MB) | Speedup |
+| -----: | --: | :---: | ----: | -------: | -------------: | ---------: | ------: |
+|     64 | 128 |  no   | 634.3 |    12.61 |          220.8 |          – |   1.00x |
+|     64 | 128 |  yes  | 613.0 |    13.05 |          214.6 |       14.2 |   0.97x |
+|    128 | 256 |  no   | 562.3 |    14.23 |          245.1 |          – |   1.00x |
+|    128 | 256 |  yes  | 660.0 |    12.12 |          229.3 |       28.3 |   1.17x |
+|    256 | 256 |  no   | 415.6 |    19.25 |          262.8 |          – |   1.00x |
+|    256 | 256 |  yes  | 584.6 |    13.68 |          240.3 |       37.7 |   1.41x |
 
 ### Correctness
 
@@ -101,18 +112,15 @@ for the whole forward pass. Net for the modern model: 11.6% better perplexity fo
 throughput. The same cost appears at inference — 41 vs 54 tok/s at batch 1, an independent
 measurement agreeing with the training figure.
 
-**4. The KV cache is a throughput optimization, not a latency one — below batch 8 it is
-slower.** This is the most counter-intuitive result here, and "add a KV cache, get faster
-generation" is repeated everywhere without it. Read the cache-on column above: **12.0 →
-15.6 ms/step while batch grows 16x.** Single-token decoding is bound by kernel _launches_,
-not arithmetic, so the GPU sits idle and sixteen sequences cost about what one does. The
-cache-off column goes 11.9 → 80.2 ms, because it recomputes the whole prefix for every
-token of every sequence, and that is real work that scales. The cache's benefit is
-proportional to work it removes; its cost is a fixed per-token overhead paid regardless. At
-batch 1 there is not enough in flight for the O(n²) term to cost anything. The honest
-framing: **it converts a compute-bound O(n²) decode into a launch-bound O(n) decode, buying
-throughput at constant latency** — what serving concurrent users needs, and why it does
-nothing for one interactive session.
+**4. Whether the KV cache helps at all depends entirely on whether you are compute-bound.**
+On the GPU it does essentially nothing here — 0.88x to 1.18x across batch 1 to 32. On CPU
+the same code is **11x to 38x faster**, and the gap widens with prompt length. The reason
+is not the cache; it is what surrounds it. Decoding one token of a 30M model leaves an
+RTX 3050 almost entirely idle, so the uncached path's extra work costs nothing in
+wall-clock and the cache's per-step overhead is all you measure. A CPU has no such slack:
+recomputing the prefix is real work, and removing it is the whole game. "Add a KV cache,
+get faster generation" is repeated everywhere without this condition attached. It is a fix
+for a compute bottleneck, and if you do not have one it buys you nothing.
 
 **5. `torch.cuda.is_bf16_supported()` lies on Turing, and it cost 3.4x.**
 It defaults to `including_emulation=True`, so on a T4 (SM 7.5) the compute-capability test
@@ -122,10 +130,14 @@ against ~31K after switching to fp16**, on hardware whose fp16 tensor cores were
 idle the whole time. `pick_amp_dtype()` checks compute capability directly — bf16 hardware
 starts at SM 8.0.
 
-**6. Small models are vocab-dominated.** With `n_embd=384` against a 50,304-token
-vocabulary, `lm_head` is ~65% of total FLOPs. Throughput intuitions calibrated on parameter
-count will be wrong, and it is why `--compile` (which fuses the cross-entropy) is the
-largest remaining optimization.
+**6. Small models are vocab-dominated, and it corrupted an earlier measurement.**
+With `n_embd=384` against a 50,304-token vocabulary, `lm_head` is ~65% of total FLOPs. The
+generation loop was projecting *every* prefill position through it and discarding all but
+the last row: **63.9 ms versus 6.2 ms** for the projection alone at a 91-token prompt, and
+**883 ms versus 276 ms** for a whole prefill forward. Fixing it cut prefill latency 3.2x —
+and, less comfortably, revealed that an earlier "5.15x KV cache speedup" was mostly this
+waste rather than the cache, since the uncached path pays it on every single token. Profile
+the baseline before you credit the optimization.
 
 **7. Perplexity on a short prompt ranks models backwards.** On a 7-token prompt the
 baseline scores 12.7 and the modern model 16.5 — the reverse of their validation ranking.

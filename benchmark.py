@@ -16,6 +16,7 @@ memory do not depend on the weights, so random init is fine for timing.
 """
 
 import os
+import glob
 import time
 import math
 import argparse
@@ -292,6 +293,39 @@ def check_baseline_parity():
     return ok
 
 
+def export_weights(args):
+    """Strip a training checkpoint down to what inference needs.
+
+    A checkpoint is ~360MB, of which 240MB is AdamW state and 120MB is fp32
+    weights. Deployment needs neither: bf16 weights measured identical CPU
+    throughput to fp32 (58.3 vs 58.9 tok/s) at half the size. torch.save already
+    stores the tied wte/lm_head tensor once, so no manual dedupe is needed.
+    """
+    sources = sorted(glob.glob(os.path.join(args.src, "*", "ckpt.pt")))
+    if not sources:
+        raise SystemExit(f"no checkpoints under {args.src}/*/ckpt.pt")
+    os.makedirs(args.out, exist_ok=True)
+    total_before = total_after = 0
+
+    for path in sources:
+        name = os.path.basename(os.path.dirname(path))
+        ckpt = torch.load(path, map_location="cpu", weights_only=False)
+        model = GPT(GPTConfig(**ckpt["config"]))
+        model.load_state_dict(ckpt["model"])
+        model.eval().to(torch.bfloat16)
+        target = os.path.join(args.out, f"{name}.pt")
+        torch.save({"config": ckpt["config"], "model": model.state_dict(),
+                    "step": ckpt.get("step"), "val_loss": ckpt.get("val_loss")}, target)
+        before, after = os.path.getsize(path) / 1e6, os.path.getsize(target) / 1e6
+        total_before, total_after = total_before + before, total_after + after
+        print(f"{name:30s} {before:7.1f} MB -> {after:6.1f} MB  ({before / after:.1f}x)")
+        del ckpt, model
+
+    print(f"{'total':30s} {total_before:7.1f} MB -> {total_after:6.1f} MB")
+    if total_after > 900:
+        print("warning: over ~900MB, check your host's repo size limit")
+
+
 def run_checks(args, model, device):
     results = []
     print("--- baseline parity (train_gpt2.py vs --pos=learned --norm=layernorm) ---")
@@ -318,7 +352,9 @@ def parse_shapes(s):
 def get_args():
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--mode", choices=["inference", "training", "check"], default="inference")
+    p.add_argument("--mode", choices=["inference", "training", "check", "export"], default="inference")
+    p.add_argument("--src", default="log", help="export: directory of <run>/ckpt.pt")
+    p.add_argument("--out", default="models", help="export: destination directory")
     p.add_argument("--ckpt", default=None, help="checkpoint to load instead of random init")
     # architecture (ignored when --ckpt is given)
     p.add_argument("--pos", choices=["learned", "rope"], default="rope")
@@ -341,6 +377,9 @@ def get_args():
 
 def main():
     args = get_args()
+    if args.mode == "export":
+        export_weights(args)
+        return
     if isinstance(args.shapes, str):
         args.shapes = parse_shapes(args.shapes)
     device = pick_device()

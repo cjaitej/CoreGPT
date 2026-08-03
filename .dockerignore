@@ -1,0 +1,17 @@
+log/
+data/
+edu_fineweb10B/
+.git/
+__pycache__/
+*.pyc
+
+input.txt
+loss_curves.png
+*.ipynb
+
+train_gpt2.py
+fineweb.py
+hellaswag.py
+benchmark.py
+requirements.txt
+README.md

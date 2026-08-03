@@ -85,14 +85,14 @@ def encoder():
 
 
 @st.cache_resource(show_spinner=False)
-def load_checkpoint(path, device):
-    ckpt = torch.load(path, map_location=device, weights_only=False)
+def load_checkpoint(path, name, device, weight_dtype):
+    ckpt = torch.load(path, map_location="cpu", weights_only=False)
     cfg = GPTConfig(**ckpt["config"])
     model = GPT(cfg)
     model.load_state_dict(ckpt["model"])
-    model.to(device).eval()
+    model.eval().to(device=device, dtype=weight_dtype)
     info = {
-        "name": os.path.basename(os.path.dirname(path)),
+        "name": name,
         "pos": cfg.pos,
         "norm": cfg.norm,
         "params": sum(p.numel() for p in model.parameters()),
@@ -104,10 +104,10 @@ def load_checkpoint(path, device):
 
 
 @st.cache_resource(show_spinner=False)
-def untrained(pos, norm, device):
+def untrained(pos, norm, device, weight_dtype):
     cfg = GPTConfig(block_size=512, vocab_size=50304, n_layer=6, n_head=6,
                     n_embd=384, pos=pos, norm=norm)
-    model = GPT(cfg).to(device).eval()
+    model = GPT(cfg).eval().to(device=device, dtype=weight_dtype)
     info = {"name": f"untrained {pos}/{norm}", "pos": pos, "norm": norm,
             "params": sum(p.numel() for p in model.parameters()),
             "step": None, "val_loss": None, "ctx": cfg.block_size}
@@ -134,15 +134,14 @@ def stream(model, ids, limit, temperature, top_k, cached, device, dtype, seed):
     gen = torch.Generator(device=device).manual_seed(seed)
     kv = None
     if cached:
-        kv_dtype = dtype if device == "cuda" else torch.float32
-        kv = model.new_kv_cache(1, idx.size(1) + limit, device, kv_dtype)
+        kv = model.new_kv_cache(1, idx.size(1) + limit, device, KV_DTYPE)
     for step in range(limit):
         if kv is None:
             window = idx[:, -model.config.block_size:]
         else:
             window = idx if step == 0 else idx[:, -1:]
         with autocast(device, dtype):
-            logits, _ = model(window, kv_cache=kv)
+            logits, _ = model(window, kv_cache=kv, last_only=True)
         nxt = pick_next(logits[:, -1, :].float(), temperature, top_k, gen)
         idx = torch.cat([idx, nxt], dim=1)
         yield nxt.item()
@@ -174,7 +173,7 @@ def time_run(model, ids, batch, count, temperature, top_k, cached, device, dtype
     idx = torch.tensor(ids, dtype=torch.long, device=device)[None].repeat(batch, 1)
     kwargs = dict(temperature=max(temperature, 1e-6), top_k=top_k, use_cache=cached,
                   generator=torch.Generator(device=device).manual_seed(seed),
-                  kv_dtype=dtype if device == "cuda" else torch.float32)
+                  kv_dtype=KV_DTYPE)
     with autocast(device, dtype):
         model.generate(idx, min(16, count), **kwargs)
     if device == "cuda":
@@ -214,7 +213,12 @@ def stats(pairs):
 
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
-dtype = pick_amp_dtype(device) if device == "cuda" else torch.float32
+if device == "cuda":
+    WEIGHT_DTYPE, dtype = torch.float32, pick_amp_dtype(device)
+else:
+    WEIGHT_DTYPE, dtype = torch.bfloat16, torch.bfloat16
+USE_CACHE = True
+KV_DTYPE = dtype if device == "cuda" else WEIGHT_DTYPE
 hardware = torch.cuda.get_device_name(0) if device == "cuda" else "CPU"
 
 st.markdown(
@@ -222,17 +226,20 @@ st.markdown(
     f'<div class="hw">{html.escape(hardware)} &middot; {str(dtype).split(".")[-1]}</div></div>',
     unsafe_allow_html=True)
 
-found = {os.path.basename(os.path.dirname(p)): p
-         for p in sorted(glob.glob(os.path.join(ROOT, "log", "*", "ckpt.pt")))}
+found = {os.path.splitext(os.path.basename(p))[0]: p
+         for p in sorted(glob.glob(os.path.join(ROOT, "models", "*.pt")))}
+if not found:
+    found = {os.path.basename(os.path.dirname(p)): p
+             for p in sorted(glob.glob(os.path.join(ROOT, "log", "*", "ckpt.pt")))}
 
 if found:
     names = st.sidebar.multiselect("Checkpoints", list(found), default=list(found)[:2])
-    loaded = [load_checkpoint(found[name], device) for name in names]
+    loaded = [load_checkpoint(found[name], name, device, WEIGHT_DTYPE) for name in names]
 else:
-    st.sidebar.caption("No checkpoints in log/*/ckpt.pt — using untrained models.")
+    st.sidebar.caption("No weights in models/*.pt or log/*/ckpt.pt — using untrained models.")
     names = st.sidebar.multiselect("Untrained", ["rope/rmsnorm", "learned/layernorm"],
                                    default=["rope/rmsnorm"])
-    loaded = [untrained(*name.split("/"), device) for name in names]
+    loaded = [untrained(*name.split("/"), device, WEIGHT_DTYPE) for name in names]
 
 st.sidebar.divider()
 limit = st.sidebar.slider("Max new tokens", 8, 400, 120, 8)
@@ -253,9 +260,9 @@ with gen_tab:
     run, hint = st.columns([1, 5])
     go = run.button("Generate", type="primary", width="stretch")
     hint.markdown(
-        '<div class="note">Every model here decodes without the KV cache, which is the '
-        'faster path at batch 1, so the speed gap is the cost of RoPE and RMSNorm. The '
-        'cache is measured in the next tab.</div>', unsafe_allow_html=True)
+        '<div class="note">Every model decodes with the KV cache on, so the speed gap '
+        'here is the cost of RoPE and RMSNorm. The cache itself is measured in the next '
+        'tab.</div>', unsafe_allow_html=True)
 
     if go:
         ids = enc.encode(prompt) if prompt.strip() else [enc.eot_token]
@@ -280,7 +287,7 @@ with gen_tab:
                 out, text = [], ""
                 start = time.perf_counter()
                 for i, token in enumerate(stream(model, ids, count + extra, temperature,
-                                                 top_k or None, False, device, dtype,
+                                                 top_k or None, USE_CACHE, device, dtype,
                                                  int(seed))):
                     out.append(token)
                     text = enc.decode(out)
