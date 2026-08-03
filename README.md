@@ -1,6 +1,6 @@
 # CoreGPT
 
-GPT-2 with three Llama-era changes, each measured in isolation.
+GPT-2 with three architectural changes, each measured in isolation.
 
 **[Live demo](https://coregpt.proudbay-827b9367.centralindia.azurecontainerapps.io/)** — all three models side by side on one prompt. Runs on CPU and scales to zero, so the first load after an idle period takes ~30s to wake.
 

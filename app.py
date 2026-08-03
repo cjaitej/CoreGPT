@@ -428,7 +428,7 @@ with model_tab:
         "Context": info["ctx"],
     } for _, info in loaded], width="stretch", hide_index=True)
 
-    if st.button("Free GPU memory"):
+    if st.button("Reload models" if device == "cuda" else "Free memory"):
         st.cache_resource.clear()
         gc.collect()
         if device == "cuda":

@@ -1,5 +1,5 @@
 """
-Modern nanoGPT: GPT-2 with Llama-inspired architectural improvements.
+CoreGPT: GPT-2 with RoPE, RMSNorm and a KV cache.
 
 Same training recipe as train_gpt2.py -- the architecture is flag-gated instead,
 so this one file runs every row of the comparison table:
@@ -36,21 +36,7 @@ from torch.nn import functional as F
 # Normalization
 
 class RMSNorm(nn.Module):
-    """Root-mean-square layer norm (Zhang & Sennrich 2019), as used by Llama.
-
-    LayerNorm subtracts the mean and divides by the standard deviation, then
-    applies a learned scale and shift. RMSNorm drops the mean-centering and the
-    bias entirely:
-
-        y = x / sqrt(mean(x^2) + eps) * weight
-
-    The claim is that re-centering contributes little to LayerNorm's benefit --
-    the re-scaling does the work -- so dropping it saves a pass over the feature
-    dimension and one parameter tensor per norm with no loss in quality.
-
-    The statistics are computed in fp32 even under autocast: the mean of squares
-    of a 768-wide bf16 vector loses meaningful precision otherwise.
-    """
+    """RMSNorm: rescale without re-centering, no bias. Stats in fp32."""
 
     def __init__(self, dim, eps=1e-6):
         super().__init__()
@@ -82,14 +68,7 @@ def rotate_half(x):
 
 
 def apply_rotary(q, k, cos, sin):
-    """Rotate q and k in place of adding a position embedding.
-
-    q, k:      (B, nh, T, hs)
-    cos, sin:  (1, 1, T, hs), fp32
-
-    Done in fp32 then cast back -- the rotation is a similarity-preserving
-    transform and doing it in bf16 injects avoidable error into every score.
-    """
+    """q, k: (B, nh, T, hs). cos, sin: (1, 1, T, hs). Rotated in fp32."""
     dtype = q.dtype
     q, k = q.float(), k.float()
     q_out = q * cos + rotate_half(q) * sin
@@ -98,30 +77,12 @@ def apply_rotary(q, k, cos, sin):
 
 
 class RotaryEmbedding(nn.Module):
-    """Precomputed cos/sin tables for RoPE (Su et al. 2021).
-
-    Learned absolute position embeddings add a vector to the token embedding
-    once, at the bottom of the network, and the model has to carry that
-    information up through every layer. RoPE instead rotates q and k by an
-    angle proportional to their absolute position, at every layer. Because the
-    attention score is an inner product,
-
-        <R(m) q, R(n) k> = <q, R(n - m) k>
-
-    the score depends only on the *relative* offset n - m. Position information
-    is injected where it is actually used, and it never occupies a slot in the
-    residual stream.
-
-    Tables are registered non-persistently: they are a deterministic function of
-    (head_dim, max_seq_len, theta), so keeping them out of the state dict means
-    checkpoints stay portable across context-length changes.
-    """
+    """Precomputed cos/sin tables for RoPE. Buffers are non-persistent."""
 
     def __init__(self, head_dim, max_seq_len, theta=10000.0):
         super().__init__()
         assert head_dim % 2 == 0, "RoPE needs an even head dimension"
-        # inv_freq[i] = 1 / theta^(2i/d): low dims rotate fast (local detail),
-        # high dims rotate slowly (long-range position).
+        # low dims rotate fast, high dims slowly
         inv_freq = 1.0 / (theta ** (torch.arange(0, head_dim, 2, dtype=torch.float32) / head_dim))
         t = torch.arange(max_seq_len, dtype=torch.float32)
         freqs = torch.outer(t, inv_freq)                 # (T, hs/2)
@@ -130,12 +91,7 @@ class RotaryEmbedding(nn.Module):
         self.register_buffer("sin_cached", emb.sin()[None, None, :, :], persistent=False)
 
     def forward(self, pos_start, seq_len):
-        """Slice the tables for absolute positions [pos_start, pos_start+seq_len).
-
-        pos_start is non-zero when decoding with a KV cache: token number 500
-        must be rotated by its true position, not by 0 just because it is the
-        only token in this forward pass.
-        """
+        """Slice for absolute positions [pos_start, pos_start+seq_len)."""
         end = pos_start + seq_len
         assert end <= self.cos_cached.size(2), (
             f"position {end} exceeds RoPE table length {self.cos_cached.size(2)}")
@@ -145,19 +101,7 @@ class RotaryEmbedding(nn.Module):
 # KV cache
 
 class KVCache:
-    """Preallocated per-layer key/value cache for autoregressive decoding.
-
-    Without a cache, generating token t re-runs the whole prefix through every
-    layer: total work over n generated tokens is O(n^2) forward passes worth of
-    projections. But keys and values for a given position never change once
-    computed -- causal masking means position i cannot see anything after it.
-    So we compute them once and keep them.
-
-    Buffers are allocated up front rather than grown by torch.cat, which would
-    reallocate and copy the entire cache on every single token.
-
-    Memory cost: 2 * n_layer * B * max_seq_len * n_head * head_dim * itemsize.
-    """
+    """Preallocated per-layer key/value cache. 2*n_layer*B*T*n_head*hs*itemsize."""
 
     def __init__(self, n_layer, batch_size, max_seq_len, n_head, head_dim, device, dtype):
         shape = (batch_size, n_head, max_seq_len, head_dim)
@@ -167,11 +111,7 @@ class KVCache:
         self.pos = 0  # number of valid cached tokens
 
     def update(self, layer_idx, k, v):
-        """Append this step's k/v for one layer, return everything cached so far.
-
-        Writes at self.pos for every layer; advance() is called once per forward
-        pass after all layers have written, so they stay aligned.
-        """
+        """Append this step's k/v, return everything cached so far."""
         T = k.size(2)
         assert self.pos + T <= self.max_seq_len, "KV cache overflow"
         self.k[layer_idx][:, :, self.pos:self.pos + T] = k
@@ -220,12 +160,9 @@ class CausalSelfAttention(nn.Module):
         if kv_cache is not None:
             k, v = kv_cache.update(layer_idx, k, v)
 
-        # is_causal aligns its mask to the top-left of the (q_len, kv_len) score
-        # matrix. During cached decode q_len == 1 while kv_len == pos + 1, so
-        # is_causal=True would let the new token see only position 0. Every
-        # cached position is a valid target for a single new query, so no mask
-        # is needed there. Chunked prefill (T > 1 into a non-empty cache) would
-        # need a real mask and is not supported.
+        # is_causal aligns its mask top-left, so during decode (q_len 1,
+        # kv_len pos+1) it would mask everything but position 0. No mask is
+        # needed there: every cached position is valid for the new query.
         assert not (T > 1 and kv_cache is not None and kv_cache.pos > 0), \
             "chunked prefill is not supported"
         y = F.scaled_dot_product_attention(q, k, v, is_causal=(T > 1))
@@ -282,10 +219,8 @@ class GPT(nn.Module):
 
         if config.pos not in ("learned", "rope"):
             raise ValueError(f"unknown pos: {config.pos}")
-        # Submodules are created in the same order as train_gpt2.py so that a
-        # given seed produces bit-identical weights in the --pos=learned
-        # --norm=layernorm configuration. That makes the baseline row of the
-        # comparison table a real control rather than a re-roll of the dice.
+        # same construction order as train_gpt2.py, so --pos=learned
+        # --norm=layernorm gives bit-identical weights under one seed
         modules = dict(wte = nn.Embedding(config.vocab_size, config.n_embd))
         if config.pos == "learned":
             modules["wpe"] = nn.Embedding(config.block_size, config.n_embd)
@@ -294,9 +229,8 @@ class GPT(nn.Module):
         self.transformer = nn.ModuleDict(modules)
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         if config.pos == "rope":
-            # RoPE replaces wpe outright: block_size * n_embd fewer parameters
-            # (786,432 at GPT-2 124M) and no learned table to run off the end
-            # of. It holds only buffers, so it consumes no init randomness.
+            # replaces wpe: block_size * n_embd fewer params, buffers only
+            # so it consumes no init randomness
             self.rope = RotaryEmbedding(
                 config.n_embd // config.n_head, config.block_size, config.rope_theta)
 
@@ -342,10 +276,8 @@ class GPT(nn.Module):
             kv_cache.advance(T)
         # forward the final layernorm and the classifier
         x = self.transformer.ln_f(x)
-        # Sampling only ever reads the last position, but lm_head is the single most
-        # expensive op in a small model (~65% of FLOPs at n_embd=384 against a 50304
-        # vocab). Projecting the whole prefill and discarding all but the last row
-        # measured 63.9ms vs 6.2ms on CPU at a 91-token prompt.
+        # sampling reads only the last position, and lm_head is ~65% of FLOPs
+        # here, so projecting the whole prefill and discarding it is wasteful
         if last_only and targets is None:
             x = x[:, -1:]
         logits = self.lm_head(x) # (B, T, vocab_size)
@@ -369,12 +301,7 @@ class GPT(nn.Module):
     @torch.no_grad()
     def generate(self, idx, max_new_tokens, temperature=1.0, top_k=50,
                  use_cache=True, generator=None, kv_dtype=torch.float32):
-        """Sample max_new_tokens continuations of idx (B, T).
-
-        use_cache=False reproduces the original nanoGPT loop: the entire
-        sequence is re-forwarded for every token. use_cache=True forwards the
-        prompt once, then one token at a time.
-        """
+        """Sample max_new_tokens continuations of idx (B, T)."""
         self.eval()
         B = idx.size(0)
         cache = None
@@ -489,17 +416,10 @@ class GPT(nn.Module):
 # -----------------------------------------------------------------------------
 
 def pick_amp_dtype(device_type):
-    """bf16 only where there is hardware for it, otherwise fp16.
+    """bf16 only where there is hardware for it (SM 8.0+), otherwise fp16.
 
-    Deliberately NOT torch.cuda.is_bf16_supported(): that defaults to
-    including_emulation=True, so on Turing (SM 7.5, e.g. Kaggle's T4) the
-    compute-capability test fails but it falls through to an emulation check
-    that succeeds and returns True. Turing has fp16 tensor cores and no bf16
-    ones, so taking it at its word puts every matmul on a non-tensor-core path.
-    Measured on a Kaggle T4: ~11k tok/s under emulated bf16, where the point of
-    this function was to select fp16 in exactly that case.
-
-    bf16 tensor cores start at SM 8.0 (Ampere).
+    Not is_bf16_supported(): it defaults to including_emulation=True and
+    returns True on Turing, which has no bf16 tensor cores.
     """
     if device_type != "cuda":
         return torch.bfloat16
@@ -530,8 +450,7 @@ class DataLoaderLite:
             if verbose:
                 print(f"found {len(shards)} shards for split {split}")
         elif os.path.isfile(data_dir):
-            # single raw text file (e.g. input.txt) -- for local smoke tests.
-            # 90/10 split, tokenized once and held in memory.
+            # single raw text file for smoke tests, 90/10 split, held in memory
             import tiktoken
             enc = tiktoken.get_encoding("gpt2")
             with open(data_dir, "r", encoding="utf-8") as f:
@@ -557,8 +476,7 @@ class DataLoaderLite:
         self.current_position = self.B * self.T * self.process_rank
 
     def state_dict(self):
-        # store the position with this rank's stride removed, so only rank 0
-        # needs to checkpoint and every rank still resumes to its own offset
+        # strip this rank's stride so only rank 0 needs to checkpoint
         return {"current_shard": self.current_shard,
                 "current_position": self.current_position - self.B * self.T * self.process_rank}
 
@@ -614,8 +532,7 @@ def get_args():
     p.add_argument("--pos", choices=["learned", "rope"], default="rope")
     p.add_argument("--norm", choices=["layernorm", "rmsnorm"], default="rmsnorm")
     p.add_argument("--rope_theta", type=float, default=10000.0)
-    # model size. Defaults are a ~30M "small" model that finishes an ablation
-    # inside one Kaggle session; see README for the 124M GPT-2 flags.
+    # ~30M by default, sized to finish an ablation in one Kaggle session
     p.add_argument("--n_layer", type=int, default=6)
     p.add_argument("--n_head", type=int, default=6)
     p.add_argument("--n_embd", type=int, default=384)
@@ -680,10 +597,7 @@ def main():
 
     device_type = "cuda" if device.startswith("cuda") else "cpu"
 
-    # Kaggle's T4 is SM 7.5 and has no bf16 support, so pick the dtype from the
-    # hardware instead of hardcoding it. fp16 has the same 10-bit mantissa as
-    # bf16 but far less exponent range, so it needs loss scaling to keep small
-    # gradients from flushing to zero; bf16 does not.
+    # fp16 needs loss scaling to keep small gradients from flushing to zero
     amp_dtype = getattr(torch, args.dtype) if args.dtype != "auto" else pick_amp_dtype(device_type)
     use_scaler = (amp_dtype == torch.float16)
     scaler = torch.amp.GradScaler(device_type, enabled=use_scaler)
@@ -778,9 +692,8 @@ def main():
             'optimizer': optimizer.state_dict(),
             'scaler': scaler.state_dict() if use_scaler else None,
             'train_loader': train_loader.state_dict(),
-            # asdict, not the dataclass instance: pickling GPTConfig records it as
-            # __main__.GPTConfig, which fails to load from any other entry point
-            # (benchmark.py, a notebook) where __main__ is a different module
+            # asdict, not the instance: pickling GPTConfig records it as
+            # __main__.GPTConfig and fails to load from any other entry point
             'config': asdict(config),
             'args': vars(args),
             'step': step,
@@ -818,7 +731,6 @@ def main():
                 dist.all_reduce(val_loss_accum, op=dist.ReduceOp.AVG)
             last_val_loss = val_loss_accum.item()
             if master_process:
-                # perplexity = exp(cross-entropy); the headline number for the report
                 print(f"validation loss: {last_val_loss:.4f} | ppl: {math.exp(last_val_loss):.2f}")
                 log(f"{step} val {last_val_loss:.4f}")
 
@@ -901,9 +813,8 @@ def main():
                   f"norm: {norm:.4f} | dt: {dt*1000:.2f}ms | tok/sec: {tokens_per_sec:.2f}")
             log(f"{step} train {loss_accum.item():.6f}")
 
-        # Checkpoint at the *end* of the iteration, so ckpt["step"] == N means
-        # step N is complete and resuming at N+1 neither repeats nor drops an
-        # optimizer update. Kaggle sessions die at ~12h; save often.
+        # at the end of the iteration, so ckpt["step"] == N means N completed
+        # and resuming at N+1 neither repeats nor drops an update
         if master_process and (step % args.ckpt_every == 0 or last_step):
             save_checkpoint(step, last_val_loss)
 

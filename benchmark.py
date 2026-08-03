@@ -199,11 +199,7 @@ def bench_training(args, model, device, device_type, amp_dtype):
 
 @torch.no_grad()
 def check_cache(args, model, device):
-    """The cache is only a valid optimization if it is a no-op numerically.
-
-    Forward the whole sequence at once, then replay it one token at a time
-    through the cache, and compare logits at every position.
-    """
+    """Forward the whole sequence, then replay it one token at a time."""
     model.float().eval()  # fp32: we are checking math, not speed
     B, T = 2, min(64, model.config.block_size)
     idx = torch.randint(0, model.config.vocab_size, (B, T), device=device)
@@ -228,11 +224,7 @@ def check_cache(args, model, device):
 
 @torch.no_grad()
 def check_rope_relative(device):
-    """RoPE's whole claim: <R(m)q, R(n)k> depends only on n - m.
-
-    Three query/key pairs placed at absolute positions 3/7, 10/14 and 50/54 all
-    have offset +4, so all three must produce the same attention score.
-    """
+    """Pairs at 3/7, 10/14 and 50/54 all have offset +4 and must score alike."""
     from train_modern_gpt import RotaryEmbedding, apply_rotary
     head_dim = 32
     rope = RotaryEmbedding(head_dim, 128).to(device)
@@ -260,12 +252,10 @@ def check_rope_relative(device):
 
 @torch.no_grad()
 def check_baseline_parity():
-    """--pos=learned --norm=layernorm must BE the original nanoGPT model.
+    """--pos=learned --norm=layernorm must be the original model, weight for weight.
 
-    Without this the baseline row of the comparison table is just a different
-    random model, and any loss gap could be the seed rather than the
-    architecture. train_gpt2.py runs its training loop at import time, so we
-    exec only the part above the data-loading section to get at its classes.
+    train_gpt2.py trains at import time, so only the part above the data
+    section is exec'd.
     """
     src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "train_gpt2.py"),
                encoding="utf-8").read()
@@ -294,13 +284,7 @@ def check_baseline_parity():
 
 
 def export_weights(args):
-    """Strip a training checkpoint down to what inference needs.
-
-    A checkpoint is ~360MB, of which 240MB is AdamW state and 120MB is fp32
-    weights. Deployment needs neither: bf16 weights measured identical CPU
-    throughput to fp32 (58.3 vs 58.9 tok/s) at half the size. torch.save already
-    stores the tied wte/lm_head tensor once, so no manual dedupe is needed.
-    """
+    """Strip a checkpoint to inference weights: drop optimizer state, cast bf16."""
     sources = sorted(glob.glob(os.path.join(args.src, "*", "ckpt.pt")))
     if not sources:
         raise SystemExit(f"no checkpoints under {args.src}/*/ckpt.pt")
