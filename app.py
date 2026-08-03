@@ -17,6 +17,7 @@ if ROOT not in sys.path:
 from train_modern_gpt import GPT, GPTConfig, pick_amp_dtype
 
 SLACK = 60
+STREAM_EVERY = 8
 ACCENTS = ["#5b9bf8", "#f2994a", "#4fbf8b", "#c77dff"]
 
 PROMPT = (
@@ -290,15 +291,18 @@ with gen_tab:
                                                  top_k or None, USE_CACHE, device, dtype,
                                                  int(seed))):
                     out.append(token)
-                    text = enc.decode(out)
-                    target.markdown(card(prompt, text, accent), unsafe_allow_html=True)
-                    if finish and i + 1 >= count and complete(text):
-                        break
+                    at_limit = i + 1 >= count
+                    if i % STREAM_EVERY == 0 or at_limit:
+                        text = enc.decode(out)
+                        target.markdown(card(prompt, text, accent), unsafe_allow_html=True)
+                        if finish and at_limit and complete(text):
+                            break
                 elapsed = time.perf_counter() - start
 
+                text = enc.decode(out)
                 if finish and not complete(text):
                     text = clip(text)
-                    target.markdown(card(prompt, text, accent), unsafe_allow_html=True)
+                target.markdown(card(prompt, text, accent), unsafe_allow_html=True)
 
                 ppl = perplexity(model, ids, device, dtype)
                 st.markdown(stats([
