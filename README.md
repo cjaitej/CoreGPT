@@ -1,25 +1,38 @@
-# Modern nanoGPT
+# CoreGPT
 
-Modernizing GPT-2 with Llama-inspired architectural changes, measured one at a time.
+GPT-2 with three Llama-era changes, each measured in isolation.
 
-Three changes to a from-scratch GPT-2 reproduction, each isolated in its own training run
-so the effect of every one is separately attributable:
+| | Val loss | PPL | vs baseline |
+| :--- | ---: | ---: | ---: |
+| GPT-2 baseline | 4.0489 | 57.33 | — |
+| **+ RoPE** | **3.9251** | **50.66** | **−11.6%** |
+| + RoPE + RMSNorm | 3.9277 | 50.79 | −11.4% |
 
-| Change       | What it replaces                                                    | Retrain? |
-| :----------- | :------------------------------------------------------------------ | :------: |
-| **RoPE**     | Learned position embeddings → rotate Q/K by position in every layer |   yes    |
-| **RMSNorm**  | LayerNorm → drop mean-centering and the bias                        |   yes    |
-| **KV cache** | Recomputing the prefix each step → store K/V, decode one token      |    no    |
+RoPE buys the accuracy. RMSNorm buys back the speed RoPE costs. A KV cache does nothing on
+a GPU at this size and is worth 11–38× on CPU.
 
+---
+
+## What changed
+
+```mermaid
+flowchart TB
+    T["token embeddings"]
+    T -->|GPT-2| P["+ learned position table<br/>(block_size x n_embd params)"]
+    T -->|CoreGPT| R["nothing added<br/>(table deleted)"]
+    P --> B1["LayerNorm → Attention<br/>LayerNorm → MLP"]
+    R --> B2["RMSNorm → Attention, Q/K rotated by position<br/>RMSNorm → MLP"]
+    B1 --> O["logits"]
+    B2 --> O
 ```
-train_gpt2.py          original GPT-2, unmodified (the control)
-train_modern_gpt.py    flag-gated model + training loop
-benchmark.py           inference / training / correctness harness
-app.py                 Streamlit demo
-kaggle_train.ipynb     runs all three ablations
-```
 
-Architecture is selected by flags, so one file produces every row of the table:
+| Change | What it replaces | Retrain? |
+| :--- | :--- | :---: |
+| **RoPE** | Learned position embeddings → rotate Q/K by position, every layer | yes |
+| **RMSNorm** | LayerNorm → drop mean-centering and the bias | yes |
+| **KV cache** | Recomputing the prefix each step → store K/V, decode one token | no |
+
+Architecture is selected by flags, so one file produces every row:
 
 ```bash
 python train_modern_gpt.py --pos=learned --norm=layernorm   # baseline
@@ -31,50 +44,28 @@ python train_modern_gpt.py --pos=rope    --norm=rmsnorm     # + RMSNorm
 
 ## Results
 
-30M params (6 layers, 6 heads, 384 dim, 512 context), 4000 steps × 131,072 tokens =
-**524M tokens** of FineWeb-Edu per run. Identical seed, data order and LR schedule across
-all three; only `--pos` and `--norm` differ. Trained on a Kaggle T4.
+30M params (6L / 6H / 384d / 512 ctx), 4000 steps × 131,072 tokens = **524M tokens** of
+FineWeb-Edu each. Identical seed, data order and LR schedule; only `--pos` and `--norm`
+differ. Trained on a Kaggle T4.
 
-| Model    | Position | Norm      |     Params |   Val loss |       PPL |           Δ | Train tok/s |
-| :------- | :------- | :-------- | ---------: | ---------: | --------: | ----------: | ----------: |
-| baseline | learned  | LayerNorm | 30,160,896 |     4.0489 |     57.33 |           — |      54,830 |
-| + RoPE   | rope     | LayerNorm | 29,964,288 | **3.9251** | **50.66** | **−0.1238** |      40,425 |
-| modern   | rope     | RMSNorm   | 29,959,296 |     3.9277 |     50.79 |     −0.1212 |      45,259 |
+![Training and validation loss for the three ablations](loss_curves.png)
+
+| Model | Position | Norm | Params | Val loss | PPL | Train tok/s |
+| :--- | :--- | :--- | ---: | ---: | ---: | ---: |
+| baseline | learned | LayerNorm | 30,160,896 | 4.0489 | 57.33 | 54,830 |
+| + RoPE | rope | LayerNorm | 29,964,288 | **3.9251** | **50.66** | 40,425 |
+| modern | rope | RMSNorm | 29,959,296 | 3.9277 | 50.79 | 45,259 |
 
 ### KV cache
 
-Measured with `lm_head` projecting **only the last position on both paths** — see finding 5.
-A naive uncached baseline that projects the whole prefix every step makes the cache look
-2-5x better than it is, because most of that gap is a wasted matmul rather than the cache.
+Both paths project only the last position through `lm_head` — see finding 4.
 
-GPU (RTX 3050), modern model, 160 new tokens:
-
-| Batch | cache off | cache on | Speedup |
-| ----: | --------: | -------: | ------: |
-|     1 | 16.48 ms/step | 13.92 |   1.18x |
-|     4 |         12.85 | 14.68 |   0.88x |
-|     8 |         12.39 | 13.65 |   0.91x |
-|    16 |         13.12 | 13.12 |   1.00x |
-|    32 |         20.43 | 18.87 |   1.08x |
-
-CPU (2 threads, bf16), batch 1:
-
-| Prompt | Gen | cache off | cache on |    Speedup |
-| -----: | --: | --------: | -------: | ---------: |
-|     20 |  60 |  6.5 tok/s |     71.1 |  **11.0x** |
-|     73 | 120 |       2.6 |     62.5 |  **24.3x** |
-|    190 | 120 |       1.4 |     52.2 |  **38.5x** |
-
-GPU, batch 8, by context length:
-
-| Prompt | Gen | Cache | Tok/s | ms/token | Peak VRAM (MB) | Cache (MB) | Speedup |
-| -----: | --: | :---: | ----: | -------: | -------------: | ---------: | ------: |
-|     64 | 128 |  no   | 634.3 |    12.61 |          220.8 |          – |   1.00x |
-|     64 | 128 |  yes  | 613.0 |    13.05 |          214.6 |       14.2 |   0.97x |
-|    128 | 256 |  no   | 562.3 |    14.23 |          245.1 |          – |   1.00x |
-|    128 | 256 |  yes  | 660.0 |    12.12 |          229.3 |       28.3 |   1.17x |
-|    256 | 256 |  no   | 415.6 |    19.25 |          262.8 |          – |   1.00x |
-|    256 | 256 |  yes  | 584.6 |    13.68 |          240.3 |       37.7 |   1.41x |
+| GPU (RTX 3050), 160 tokens | Speedup | | CPU (2 threads), batch 1 | Speedup |
+| :--- | ---: | :--- | :--- | ---: |
+| batch 1 | 1.18× | | 20-token prompt | **11.0×** |
+| batch 4 | 0.88× | | 73-token prompt | **24.3×** |
+| batch 16 | 1.00× | | 190-token prompt | **38.5×** |
+| batch 32 | 1.08× | | | |
 
 ### Correctness
 
@@ -82,102 +73,83 @@ GPU, batch 8, by context length:
 python benchmark.py --mode=check
 ```
 
-| Property                                     | Result                                                      |
-| :------------------------------------------- | :---------------------------------------------------------- |
-| Baseline is bit-identical to `train_gpt2.py` | max weight diff **0.0e+00**, max logit diff **0.0e+00**     |
-| RoPE scores depend only on relative offset   | spread **1.9e-06** across absolute positions 3/10/50        |
-| KV cache changes speed and nothing else      | **5.7e-06 – 1.4e-05** max logit diff on trained checkpoints |
+| Property | Result |
+| :--- | :--- |
+| Baseline is bit-identical to `train_gpt2.py` | weight diff **0.0e+00**, logit diff **0.0e+00** |
+| RoPE scores depend only on relative offset | spread **1.9e-06** across positions 3/10/50 |
+| KV cache changes speed and nothing else | **5.7e-06 – 1.4e-05** logit diff on trained weights |
 
-The parity check is what makes the rest meaningful: submodules are constructed in the same
-order as the original, so under one seed `--pos=learned --norm=layernorm` produces
-bit-identical weights. Every gap in the table is architecture, not RNG.
+The parity check is what makes the rest meaningful: submodules are built in the same order
+as the original, so under one seed `--pos=learned --norm=layernorm` produces bit-identical
+weights. Every gap above is architecture, not RNG.
 
 ---
 
 ## Findings
 
-**1. RoPE delivers all of the quality gain; RMSNorm delivers none.**
-RoPE alone: −0.124 nats, 11.6% lower perplexity, while _removing_ 196,608 parameters.
-Adding RMSNorm moves val loss by +0.0026 — noise.
+**1. RoPE does all of the quality work.** −0.124 nats, 11.6% lower perplexity, while
+*removing* 196,608 parameters. Adding RMSNorm moves val loss by +0.0026 — noise.
 
-**2. That is the correct outcome for RMSNorm, not a failure.**
-It was never a quality proposal. It is a simplification that costs nothing, and the
-measurement shows exactly that: quality flat, **throughput +12%** (40.4K → 45.3K tok/s),
-4,992 fewer parameters, one less reduction pass per norm. The reason to adopt it is that
-it is free.
+**2. That is the right outcome for RMSNorm.** It was never a quality proposal. Quality
+flat, **throughput +12%** (40.4K → 45.3K tok/s), 4,992 fewer parameters, one less reduction
+pass per norm. The reason to adopt it is that it is free.
 
-**3. RoPE is not free.** −26% training throughput against the baseline, because the
-rotation is applied to Q and K in _every layer_, where a learned embedding is one lookup
-for the whole forward pass. Net for the modern model: 11.6% better perplexity for 17% less
-throughput. The same cost appears at inference — 41 vs 54 tok/s at batch 1, an independent
-measurement agreeing with the training figure.
+**3. The KV cache only helps if you are compute-bound.** Roughly 1.0× on the GPU, 11–38× on
+CPU. Decoding one token of a 30M model leaves a GPU almost idle, so the uncached path's
+extra work costs nothing in wall-clock. A CPU has no such slack. "Add a KV cache, get
+faster generation" is repeated everywhere without this condition attached.
 
-**4. Whether the KV cache helps at all depends entirely on whether you are compute-bound.**
-On the GPU it does essentially nothing here — 0.88x to 1.18x across batch 1 to 32. On CPU
-the same code is **11x to 38x faster**, and the gap widens with prompt length. The reason
-is not the cache; it is what surrounds it. Decoding one token of a 30M model leaves an
-RTX 3050 almost entirely idle, so the uncached path's extra work costs nothing in
-wall-clock and the cache's per-step overhead is all you measure. A CPU has no such slack:
-recomputing the prefix is real work, and removing it is the whole game. "Add a KV cache,
-get faster generation" is repeated everywhere without this condition attached. It is a fix
-for a compute bottleneck, and if you do not have one it buys you nothing.
+**4. Small models are vocab-dominated, and it corrupted a measurement.** With `n_embd=384`
+against a 50,304 vocab, `lm_head` is ~65% of FLOPs. Generation was projecting *every*
+prefill position and discarding all but the last: **63.9 ms vs 6.2 ms**. Fixing it cut
+prefill 3.2× — and revealed that an earlier "5.15× KV cache speedup" was mostly this waste,
+since the uncached path paid it on every token. Profile the baseline before crediting the
+optimization.
 
-**5. `torch.cuda.is_bf16_supported()` lies on Turing, and it cost 3.4x.**
-It defaults to `including_emulation=True`, so on a T4 (SM 7.5) the compute-capability test
-fails and it falls through to an emulation check that succeeds and returns `True`.
-Selecting bf16 on that basis puts every matmul on a path with no tensor cores: **~9K tok/s,
-against ~31K after switching to fp16**, on hardware whose fp16 tensor cores were sitting
-idle the whole time. `pick_amp_dtype()` checks compute capability directly — bf16 hardware
-starts at SM 8.0.
-
-**6. Small models are vocab-dominated, and it corrupted an earlier measurement.**
-With `n_embd=384` against a 50,304-token vocabulary, `lm_head` is ~65% of total FLOPs. The
-generation loop was projecting *every* prefill position through it and discarding all but
-the last row: **63.9 ms versus 6.2 ms** for the projection alone at a 91-token prompt, and
-**883 ms versus 276 ms** for a whole prefill forward. Fixing it cut prefill latency 3.2x —
-and, less comfortably, revealed that an earlier "5.15x KV cache speedup" was mostly this
-waste rather than the cache, since the uncached path pays it on every single token. Profile
-the baseline before you credit the optimization.
-
-**7. Perplexity on a short prompt ranks models backwards.** On a 7-token prompt the
-baseline scores 12.7 and the modern model 16.5 — the reverse of their validation ranking.
-On a 392-token passage it flips to 104.5 vs 99.5, matching. Six predictions is noise; the
-app's default prompt is 73 tokens for this reason, where it reproduces the ablation
-correctly (38.0 / 30.8 / 30.8).
+**5. `torch.cuda.is_bf16_supported()` lies on Turing.** It defaults to
+`including_emulation=True`, so a T4 returns `True` despite having no bf16 tensor cores.
+Selecting bf16 on that basis put every matmul on a non-tensor-core path: **~9K tok/s vs
+~31K after switching to fp16**. `pick_amp_dtype()` checks compute capability instead.
 
 ---
 
-## Running the app
+## Run it
+
+**Demo** — Streamlit app comparing all three models side by side on one prompt, with a live
+KV-cache benchmark.
 
 ```bash
-pip install streamlit
-streamlit run app.py
+pip install streamlit && streamlit run app.py
 ```
 
-Discovers every checkpoint under `log/*/ckpt.pt` and runs any subset **side by side, same
-prompt, same seed**.
-
-- **Generate** — streaming output per model, with prompt perplexity, average tok/s and
-  average ms/token. "Finish the sentence" lets generation run past the token limit (up to
-  60 extra) to reach a sentence boundary instead of stopping mid-clause.
-- **KV cache benchmark** — identical decode with and without the cache, within one model,
-  with a batch-size slider to find the crossover. Correctness is judged on fp32 logits, not
-  on sampled text: under fp16 with temperature > 0 a ~1e-3 logit difference flips one
-  `multinomial` draw and the continuations diverge forever, which looks like corruption but
-  is only sampling.
-- **Models** — config, parameter count, step and val loss per checkpoint.
-
-Parameter counts dedupe the tied `wte`/`lm_head` weight; summing `state_dict` naively
-double-counts the 50304 × 384 embedding and over-reports by 19.3M.
-
-## Reproducing
+**Reproduce**
 
 ```bash
-python fineweb.py --shards 9              # ~900M tokens of FineWeb-Edu
-python benchmark.py --mode=check          # correctness
-python benchmark.py --mode=inference      # KV cache tables
-python benchmark.py --mode=training       # throughput per architecture
+python fineweb.py --shards 9          # ~900M tokens of FineWeb-Edu
+python benchmark.py --mode=check      # correctness
+python benchmark.py --mode=inference  # KV cache tables
+python benchmark.py --mode=export     # 1.08GB checkpoints -> 180MB bf16 weights
 ```
 
-Training runs via [`kaggle_train.ipynb`](kaggle_train.ipynb), or directly with the three
-flag combinations above. Checkpoints land in `log/<run>/` and resume with `--resume`.
+Training runs via [`kaggle_train.ipynb`](kaggle_train.ipynb) or the three flag combinations
+above. Checkpoints land in `log/<run>/` and resume with `--resume`.
+
+**Deploy** — `Dockerfile` builds a CPU-only image. All three models occupy 808MB of RAM and
+generate at ~90 tok/s on 2 cores.
+
+## Files
+
+```
+train_gpt2.py          original GPT-2, unmodified (the control)
+train_modern_gpt.py    flag-gated model + training loop
+benchmark.py           inference / training / correctness / export
+app.py                 Streamlit demo
+kaggle_train.ipynb     runs all three ablations
+```
+
+## Credit
+
+`train_gpt2.py` is Andrej Karpathy's
+[build-nanogpt](https://github.com/karpathy/build-nanogpt), kept unmodified as the control.
+
+MIT
