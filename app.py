@@ -348,13 +348,7 @@ with cache_tab:
 
     prompt_len = len(enc.encode(bench_prompt)) if bench_prompt.strip() else 1
     work = batch * count * (prompt_len + count / 2) * len(loaded)
-    st.markdown(
-        f'<div class="note">The same decode run twice inside one model. The uncached '
-        f'half re-forwards the whole prefix every step, so at batch {batch} and {count} '
-        f'tokens it moves <b>{work/1e6:.2f}M token-positions</b> across {len(loaded)} '
-        f'model(s) — the cached half moves {batch*count*len(loaded)/1e6:.3f}M. That gap '
-        f'is the measurement, and on CPU it is also the wait.</div>',
-        unsafe_allow_html=True)
+
     if device != "cuda" and work > 60_000:
         st.markdown('<div class="note">⚠ This will take a while on CPU. Drop the batch '
                     'or token count for a quicker result — the trend holds at any '
