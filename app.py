@@ -243,6 +243,7 @@ if device == "cuda":
     BENCH_BATCH, BENCH_TOKENS = 16, 160
 else:
     vcpu = cpu_budget()
+    torch.set_num_threads(max(1, int(vcpu)))
     hardware = f"CPU · {vcpu:g} vCPU · {torch.get_num_threads()} threads"
     BENCH_BATCH, BENCH_TOKENS = 4, 64
 
