@@ -2,6 +2,8 @@
 
 GPT-2 with three Llama-era changes, each measured in isolation.
 
+**[Live demo](https://coregpt.proudbay-827b9367.centralindia.azurecontainerapps.io/)** — all three models side by side on one prompt. Runs on CPU and scales to zero, so the first load after an idle period takes ~30s to wake.
+
 | | Val loss | PPL | vs baseline |
 | :--- | ---: | ---: | ---: |
 | GPT-2 baseline | 4.0489 | 57.33 | — |
@@ -115,8 +117,7 @@ Selecting bf16 on that basis put every matmul on a non-tensor-core path: **~9K t
 
 ## Run it
 
-**Demo** — Streamlit app comparing all three models side by side on one prompt, with a live
-KV-cache benchmark.
+**Demo** — [hosted](https://coregpt.proudbay-827b9367.centralindia.azurecontainerapps.io/), or locally:
 
 ```bash
 pip install streamlit && streamlit run app.py
@@ -146,10 +147,3 @@ benchmark.py           inference / training / correctness / export
 app.py                 Streamlit demo
 kaggle_train.ipynb     runs all three ablations
 ```
-
-## Credit
-
-`train_gpt2.py` is Andrej Karpathy's
-[build-nanogpt](https://github.com/karpathy/build-nanogpt), kept unmodified as the control.
-
-MIT
